@@ -25,6 +25,20 @@ rather than the docs. Most usefully: **Copilot CLI reads `CLAUDE.md` and
 `.claude/skills/` natively**, so for those two asset kinds a single copy serves both
 tools and there is nothing to translate at all.
 
+## Contents
+
+- [Quickstart](#quickstart)
+- [What's included](#whats-included) — [`pr`](#pr) · [`ask-before-diverging`](#ask-before-diverging) · [`ask-user`](#ask-user) · [`base`](#base)
+- [Step 1: set up your machine, once](#step-1-set-up-your-machine-once)
+- [Step 2: add it to a project, new or existing](#step-2-add-it-to-a-project-new-or-existing)
+- [Step 3: living with it](#step-3-living-with-it)
+- [Working on this repo](#working-on-this-repo) — [Editor setup](#editor-setup)
+- [Layout](#layout)
+- [The governing distinction](#the-governing-distinction)
+- [Why copies for projects, symlinks for you](#why-copies-for-projects-symlinks-for-you)
+- [The four rules the installer follows](#the-four-rules-the-installer-follows)
+- [Reference](#reference) · [Licence](#licence)
+
 ## Quickstart
 
 Needs **Node 22 or newer** (`.nvmrc` pins 24, the current LTS — `nvm use` picks it
@@ -41,7 +55,89 @@ bin/install list        # what exists, and where each thing would go
 included — while changing nothing. Reach for it first; it is the cheapest way to see
 what a command intends.
 
-## Step 1 — set up your machine, once
+## What's included
+
+| Asset                                           | Kind         | What it gives you                                                                        | How you reach it               |
+| ----------------------------------------------- | ------------ | ---------------------------------------------------------------------------------------- | ------------------------------ |
+| [`pr`](#pr)                                     | skill        | A PR title and description for the branch, plus a commit message for the pending changes | `/pr`, or ask for a write-up   |
+| [`ask-before-diverging`](#ask-before-diverging) | instructions | Tells the agent to ask instead of guessing — and when not to bother                      | always on, no invocation       |
+| [`ask-user`](#ask-user)                         | MCP server   | An `ask_user_question` tool: multiple-choice questions the agent can put to you mid-task | the agent calls it             |
+| [`base`](#base)                                 | template     | A starter `AGENTS.md` worth filling in                                                   | `--template templates/base.md` |
+
+`prompts/`, `agents/` and `hooks/` are empty — the machinery handles them, nothing has
+been written yet. [STATUS.md](STATUS.md) tracks what is done and what is still unknown.
+
+### `pr`
+
+**A PR write-up skill.** `skills/pr/SKILL.md` · `user-invocable`, so `/pr` reaches it directly.
+
+Produces four things in one reply, each in its own fenced block so it can be copied
+straight into the field it belongs to: a **PR title**, a **PR description**, a
+**commit subject** and a **commit body**.
+
+The point of it is a distinction that is easy to conflate and annoying to fix by
+hand: the commit message covers only the pending, uncommitted changes, while the PR
+title and description cover the whole branch — every commit since the base branch
+_plus_ the pending changes. It works those out from the cumulative diff rather than
+from `git log`, so a file added early and deleted later simply is not mentioned.
+
+It detects the base branch from `origin/HEAD` and, when that is unset, verifies which
+of `main`, `master`, `develop` or `dev` actually exists rather than assuming. Ticket
+keys matching `[A-Z]+-[0-9]+` are collected from the branch name and commit subjects
+if present, and produce no output at all when absent.
+
+| Scope    | Installs to                                              |
+| -------- | -------------------------------------------------------- |
+| personal | `~/.claude/skills/pr`, `~/.copilot/skills/pr` (symlinks) |
+| project  | `.claude/skills/pr/` — one copy, read by both tools      |
+
+### `ask-before-diverging`
+
+**An always-on rule about asking rather than guessing.**
+`instructions/ask-before-diverging.md` · an instruction fragment with no `applyTo`.
+
+Tells the agent to ask rather than guess when different readings of a request would
+lead to materially different work, and — just as importantly — when _not_ to: not for
+a conventional default, not for something answerable by reading the code, and not for
+permission to proceed. It names whichever question tool the surface offers rather
+than hardcoding one, so it works with or without the MCP server below.
+
+Being always-on, it is composed into a managed block rather than installed as a file:
+`AGENTS.md` for a project (with generated `CLAUDE.md` and
+`.github/copilot-instructions.md` pointers), or
+`~/.copilot/copilot-instructions.md` and `~/.claude/CLAUDE.md` for you personally.
+
+### `ask-user`
+
+**An MCP server exposing one tool, `ask_user_question`.**
+[`mcp/ask-user/`](mcp/ask-user/README.md) · a launched asset, registered at user level.
+
+The model passes 1–4 questions, each with 2–4 options and a short header, optionally
+`multiSelect`; the host renders them as a form via MCP elicitation and the call blocks
+until answered. Every question also gets a free-text field, so "Other" is always
+available.
+
+It degrades rather than fails: on a host that does not advertise elicitation, the tool
+returns the question as text with an instruction for the model to ask it inline and
+stop. So you keep the decision point everywhere and get the nice form where it is
+supported. Decline and cancel each return their own instruction to carry on rather
+than re-ask.
+
+> Check whether you need it first. Copilot CLI ships a built-in `ask_user` tool, which
+> may make this redundant on the CLI and desktop app — see
+> [STATUS.md](STATUS.md). Its own [README](mcp/ask-user/README.md) covers registration
+> and the elicitation constraints that shaped it.
+
+### `base`
+
+**A starter `AGENTS.md` for a project that has none.** `templates/base.md` · used only
+via `--template`.
+
+Prompts for the things worth writing down — what the project is, how to run it, and the
+conventions that are not obvious from the code — rather than filling them in for you.
+Everything above the managed block stays yours, so later runs never disturb it.
+
+## Step 1: set up your machine, once
 
 Run these from the repo. They are independent, so either can be skipped.
 
@@ -78,7 +174,7 @@ copilot instruction list      # ~/.copilot/copilot-instructions.md under "Person
 In a Copilot session, `/env` lists everything loaded — instructions, skills, agents,
 MCP servers, hooks — which is the fastest single check.
 
-## Step 2 — add it to a project, new or existing
+## Step 2: add it to a project, new or existing
 
 Personal assets already cover you everywhere. Do this for anything the **project
 itself** must carry, so CI runners and cloud agents see it too:
@@ -124,7 +220,7 @@ copilot instruction list      # AGENTS.md, CLAUDE.md and .github/copilot-instruc
 copilot skill list            # the skill under "Project skills"
 ```
 
-## Step 3 — living with it
+## Step 3: living with it
 
 **Editing an asset** takes effect differently by scope. Personal assets are symlinks,
 so a change here is live immediately with no command to run. Projects hold copies, so
@@ -142,15 +238,25 @@ convention is still unverified — see [STATUS.md](STATUS.md).
 
 ## Working on this repo
 
-Two test suites, no framework. Both drive the real thing — the installer as a
-subprocess against scratch directories, the MCP server as a client over stdio — and
-assert on what it actually produced:
+No framework. The test suites drive the real thing — the installer as a subprocess
+against scratch directories, the MCP server as a client over stdio — and assert on what
+it actually produced. A separate check verifies the documentation's own links, since the
+docs here are part of the deliverable and both ways of breaking them are silent: rename
+a heading and every anchor pointing at it dies, move a file and every relative link
+does.
 
 ```bash
-npm test                             # both
-node bin/install-test.mjs            # just the installer's
-node mcp/ask-user/smoke-test.mjs     # just the MCP server's
+npm test                             # everything
+node bin/install-test.mjs            # one suite on its own
+npm run check:docs                   # just the link check
 ```
+
+**Any file named `*-test.mjs` is picked up automatically.** `npm test` globs for them
+through Node's built-in test runner, so adding an MCP server with its own
+`smoke-test.mjs` needs no change to `package.json` — which is the same
+discovery-over-enumeration habit the installer itself follows. Node excludes
+`node_modules` from that glob, so a dependency shipping a matching filename cannot
+gatecrash the run.
 
 Prettier is the sole devDependency, for formatting:
 
@@ -206,11 +312,6 @@ docs/                    the reference material
 Every source folder is present, so the shape of the repo is visible even where nothing
 lives yet — the empty ones hold a `.gitkeep`, which discovery ignores along with any
 other dotfile.
-
-What is here so far: [`mcp/ask-user/`](mcp/ask-user/README.md), an MCP server that
-asks the user a multiple-choice clarifying question; `skills/pr/`, a PR write-up
-skill; and `instructions/ask-before-diverging.md`, a rule about asking instead of
-guessing. [STATUS.md](STATUS.md) tracks what is done and what is still unknown.
 
 ## The governing distinction
 

@@ -9,7 +9,8 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "node bin/install-test.mjs && node mcp/ask-user/smoke-test.mjs",
+    "test": "node --test \"**/*-test.mjs\" && node bin/check-docs.mjs",
+    "check:docs": "node bin/check-docs.mjs",
     "format": "prettier --write . bin/install",
     "format:check": "prettier --check . bin/install"
   },

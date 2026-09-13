@@ -147,6 +147,12 @@ Drop a `register.json` in the folder to override the inferred command:
 { "command": "python3", "args": ["/abs/path/to/server.py"] }
 ```
 
+Name its tests `smoke-test.mjs` and `npm test` will find them — the glob matches any
+`*-test.mjs` in the repo, so nothing needs registering in `package.json`. Drive the
+server over stdio as a real client rather than importing its internals, the way
+[`mcp/ask-user/smoke-test.mjs`](../mcp/ask-user/smoke-test.mjs) does: the wire protocol
+is the contract, and that is what a host will actually exercise.
+
 ## Frontmatter parsing, honestly
 
 `bin/install` implements a small YAML subset on purpose: `key: value`, inline
@@ -165,7 +171,7 @@ file stays symlinkable.
 ```bash
 bin/install list                        # every asset, and where it would go
 bin/install project /tmp/scratch --dry-run   # the exact plan, including refusals
-npm test                                # the installer's own tests
+npm test                                # every suite, plus the docs link check
 ```
 
 Note that the asset folders are excluded from Prettier — see `.prettierignore` for
