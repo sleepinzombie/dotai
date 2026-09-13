@@ -1,0 +1,23 @@
+# Editor configuration, see https://editorconfig.org
+# Cross-IDE baseline: JetBrains and most editors honour this natively, VS Code via
+# the EditorConfig extension. Prettier also reads it, so the values here are kept
+# consistent with .prettierrc — Prettier's own config wins on conflict, and a
+# disagreement would only be confusing.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+indent_style = space
+indent_size = 2
+insert_final_newline = true
+trim_trailing_whitespace = true
+max_line_length = 100
+
+[*.md]
+max_line_length = off
+
+# Two trailing spaces are a hard line break in Markdown, so trimming them changes
+# meaning rather than tidying. It matters more here than in most repos: the asset
+# folders are excluded from Prettier, so nothing else would arbitrate.
+trim_trailing_whitespace = false

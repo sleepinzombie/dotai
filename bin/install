@@ -1,0 +1,1014 @@
+#!/usr/bin/env node
+// dotai installer — stores every asset once, in a neutral form, and emits the
+// dialect each tool actually reads. See ../README.md for the reasoning; the short
+// version is that the two asset kinds need two different mechanisms:
+//
+//   personal   symlinked into your user profile, so an edit here is live everywhere
+//   project    copied into a target repo and committed, because CI runners and cloud
+//              coding agents only get a checkout of that one repo — a sibling clone
+//              of this one is not there
+//
+// No runtime dependencies, one file, like mcp/ask-user/server.mjs.
+
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+// Written into every generated file. Anything without this tag is treated as
+// hand-written and never overwritten, so a project's own AGENTS.md survives.
+const TAG = "dotai:generated";
+const BLOCK_BEGIN = "<!-- dotai:begin -->";
+const BLOCK_END = "<!-- dotai:end -->";
+
+/**
+ * The provenance line stamped into every generated file. Its presence is what
+ * tells a later run the file is ours to replace.
+ *
+ * @param {string} from Repo-relative path of the source this was generated from.
+ * @returns {string}
+ */
+const marker = (from) =>
+  `<!-- ${TAG} from ${from} — do not edit; run bin/install to regenerate -->`;
+
+// Where each asset kind lands, per target and scope. `null` means "this target has
+// no such convention" and is skipped with a note rather than guessed at.
+//
+// Two entries look like mistakes and are not:
+//   skills/project/copilot points at .claude/skills because Copilot CLI reads that
+//   folder natively — verified, see README. One copy serves both tools.
+//   prompts/project/copilot is null because the CLI has no prompt-file convention;
+//   its reusable-unit-of-instruction is a skill.
+const DESTS = {
+  skills: {
+    project: { claude: ".claude/skills", copilot: ".claude/skills", vscode: null },
+    personal: { claude: "~/.claude/skills", copilot: "~/.copilot/skills", vscode: null },
+  },
+  prompts: {
+    project: { claude: ".claude/commands", copilot: null, vscode: ".github/prompts" },
+    personal: { claude: "~/.claude/commands", copilot: null, vscode: null },
+  },
+  instructions: {
+    project: { claude: null, copilot: ".github/instructions", vscode: ".github/instructions" },
+    personal: { claude: null, copilot: "~/.copilot/instructions", vscode: null },
+  },
+  agents: {
+    project: { claude: ".claude/agents", copilot: ".github/agents", vscode: ".github/agents" },
+    personal: { claude: "~/.claude/agents", copilot: null, vscode: null },
+  },
+  hooks: {
+    project: { claude: null, copilot: ".github/hooks", vscode: null },
+    personal: { claude: null, copilot: null, vscode: null },
+  },
+};
+
+// Why some cells above are null, printed once per run so the gaps stay visible
+// instead of turning into folklore.
+const GAPS = {
+  "prompts/project/copilot":
+    "Copilot CLI has no prompt-file convention; express a reusable prompt as a skill instead.",
+  "instructions/project/claude":
+    "Claude Code has no scoped-rules format, so a fragment with an applyTo reaches Copilot only. Always-on fragments are composed into AGENTS.md and CLAUDE.md.",
+  "instructions/personal/claude":
+    "Same — always-on fragments are composed into ~/.claude/CLAUDE.md instead.",
+  "agents/personal/copilot":
+    "The personal agents directory is unconfirmed; run /env in a session to settle it.",
+  "hooks/personal/copilot":
+    "User-level hooks live inside ~/.copilot/config.json, which the tools manage themselves — merge by hand.",
+  "skills/project/vscode":
+    "VS Code agent mode's skill support is unverified, and .claude/skills already covers CLI and desktop — one copy is enough.",
+  "skills/personal/vscode": "VS Code's user-profile paths were never verified; project scope only.",
+  "prompts/personal/vscode": "Same.",
+  "instructions/personal/vscode": "Same.",
+  "agents/personal/vscode": "Same.",
+};
+
+// Per-target frontmatter: which neutral keys survive, and under what name. The
+// neutral form is deliberately close to Copilot's dialect so that the common case
+// needs no rewrite at all and can therefore be symlinked rather than copied.
+const FRONTMATTER = {
+  // `null` means pass every key through. SKILL.md is a genuinely shared format, so
+  // filtering it would drop tool-specific keys that matter — Claude Code's
+  // `user-invocable`, for one — and each tool already ignores what it doesn't know.
+  skills: { claude: null, copilot: null, vscode: null },
+  prompts: {
+    claude: ["description", ["argumentHint", "argument-hint"], "model"],
+    vscode: ["description", "mode", "model", "tools"],
+  },
+  instructions: {
+    copilot: ["description", "applyTo"],
+    vscode: ["description", "applyTo"],
+  },
+  agents: {
+    claude: ["name", "description", "tools", "model"],
+    copilot: ["name", "description", "tools", "model"],
+    vscode: ["name", "description", "tools", "model"],
+  },
+};
+
+// Filename shape per target. Copilot and VS Code both want the suffixed forms.
+const FILENAMES = {
+  prompts: { claude: (n) => `${n}.md`, vscode: (n) => `${n}.prompt.md` },
+  instructions: {
+    copilot: (n) => `${n}.instructions.md`,
+    vscode: (n) => `${n}.instructions.md`,
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Shapes
+//
+// Three types flow through the whole script, in this order:
+//
+//   Asset   what discovery found in a source folder
+//   Op      one intended filesystem change, not yet performed
+//   Results what performing them actually did
+//
+// The split matters: planning produces Ops without touching anything, and `apply`
+// is the only thing that acts. That is what makes `--dry-run` exact — it runs the
+// same planning code and simply declines to execute, rather than following a
+// parallel path that could drift out of step with the real one.
+// ---------------------------------------------------------------------------
+
+/**
+ * @typedef {"claude" | "copilot" | "vscode"} Target
+ * @typedef {"personal" | "project"} Scope
+ * @typedef {"skills" | "prompts" | "instructions" | "agents" | "hooks"} AssetKind
+ */
+
+/**
+ * One discovered asset in its neutral source form.
+ *
+ * @typedef {object} Asset
+ * @property {AssetKind | "mcp"} kind
+ * @property {string} name          Filename without extension, or folder name.
+ * @property {string} file          Absolute path to the source file.
+ * @property {string} [dir]         Absolute path to the folder, for skills and mcp.
+ * @property {Record<string, unknown>} data   Parsed frontmatter.
+ * @property {string} [body]        Everything after the frontmatter.
+ */
+
+/**
+ * One intended change. A discriminated union on `action` — the fields that matter
+ * differ per action, and `apply` is where each is handled:
+ *
+ * - `symlink`  link `to` at `from`; used only for personal assets left unrewritten
+ * - `write`    write `content` to `to`, subject to the clobber guard
+ * - `copyDir`  copy a skill folder wholesale, stamping only its SKILL.md
+ * - `block`    replace just the managed block inside `to`, leaving the rest alone
+ * - `exec`     run a command, currently only `copilot mcp add`
+ *
+ * @typedef {object} Op
+ * @property {"symlink" | "write" | "copyDir" | "block" | "exec"} action
+ * @property {string} [to]          Destination path.
+ * @property {string} [from]        Source path, or provenance for reporting.
+ * @property {string} [content]     For `write`.
+ * @property {object} [stamp]       For `copyDir`: the emitted SKILL.md.
+ * @property {string} [block]       For `block`: the replacement block, markers included.
+ * @property {string} [template]    For `block`: seed file when the target is absent.
+ * @property {string} [command]     For `exec`.
+ * @property {string[]} [args]      For `exec`.
+ * @property {Record<string, string>} [env]  For `exec`.
+ */
+
+/**
+ * What `apply` did, split so the report can distinguish "changed" from "was already
+ * right" from "declined to touch". `skipped` being non-empty is what makes the
+ * process exit non-zero.
+ *
+ * @typedef {object} Results
+ * @property {string[]} wrote
+ * @property {string[]} linked
+ * @property {string[]} ran
+ * @property {string[]} unchanged
+ * @property {string[]} skipped
+ */
+
+// ---------------------------------------------------------------------------
+// Frontmatter. A deliberately small YAML subset: `key: value`, inline `[a, b]`,
+// and `- item` lists. Enough for every asset format in play; anything richer is a
+// sign the neutral form is drifting into config, which it should not.
+// ---------------------------------------------------------------------------
+
+/**
+ * Read one YAML scalar. Recognises booleans, numbers, inline `[a, b]` arrays and
+ * quoted strings; anything else comes back as a plain string.
+ *
+ * @param {string} raw
+ * @returns {string | number | boolean | unknown[]}
+ */
+const parseScalar = (raw) => {
+  const value = raw.trim();
+  if (value === "true") return true;
+  if (value === "false") return false;
+  if (value !== "" && !Number.isNaN(Number(value)) && /^-?[\d.]+$/.test(value))
+    return Number(value);
+  if (/^\[.*\]$/.test(value)) {
+    const inner = value.slice(1, -1).trim();
+    return inner === "" ? [] : inner.split(",").map((item) => parseScalar(item));
+  }
+  if (/^(['"]).*\1$/.test(value)) return value.slice(1, -1);
+  return value;
+};
+
+/**
+ * Split a file into frontmatter and body. A file with no leading `---` is all
+ * body, which is the normal case for an always-on instruction fragment.
+ *
+ * @param {string} text
+ * @returns {{ data: Record<string, unknown>, body: string }}
+ */
+const parseFrontmatter = (text) => {
+  if (!text.startsWith("---\n")) return { data: {}, body: text };
+  // Search from index 3 so the opening delimiter cannot match itself. An unterminated
+  // block is treated as no frontmatter rather than an error — better to install the
+  // file intact than to reject it over a typo.
+  const end = text.indexOf("\n---", 3);
+  if (end === -1) return { data: {}, body: text };
+
+  const data = {};
+  let key = null;
+  // slice(4, end) is the region between the delimiters: 4 skips the opening "---\n",
+  // and `end` is the newline before the closing one.
+  for (const line of text.slice(4, end).split("\n")) {
+    if (!line.trim()) continue;
+    const item = line.match(/^\s*-\s+(.*)$/);
+    if (item && key) {
+      if (!Array.isArray(data[key])) data[key] = [];
+      data[key].push(parseScalar(item[1]));
+      continue;
+    }
+    const pair = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
+    if (!pair) continue;
+    key = pair[1];
+    // A key with nothing after it opens a `- item` list, which the branch above fills.
+    data[key] = pair[2].trim() === "" ? [] : parseScalar(pair[2]);
+  }
+
+  // end + 4 steps past "\n---"; the blank line that conventionally follows is dropped
+  // so the body starts at its first real character.
+  const rest = text.slice(end + 4);
+  return { data, body: rest.startsWith("\n") ? rest.slice(1) : rest };
+};
+
+/**
+ * Serialise one value back to YAML, quoting only when a reader would misparse it.
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+const formatScalar = (value) => {
+  if (Array.isArray(value)) return `[${value.map((item) => formatScalar(item)).join(", ")}]`;
+  if (typeof value !== "string") return String(value);
+  // Quote only what a YAML reader would actually misread: a leading indicator
+  // character, an embedded `: ` or ` #`, emptiness, or a string that would come
+  // back as a boolean or number. Quoting more than that would rewrite frontmatter
+  // gratuitously, and a rewritten file can no longer be symlinked.
+  const risky =
+    value === "" ||
+    /^[-?:,[\]{}#&*!|>'"%@`]/.test(value) ||
+    value.includes(": ") ||
+    value.includes(" #") ||
+    /^(true|false|null|~)$/i.test(value) ||
+    /^-?[\d.]+$/.test(value);
+  return risky ? `'${value.replaceAll("'", "''")}'` : value;
+};
+
+/**
+ * Serialise frontmatter, including the delimiters. Returns the empty string for an
+ * empty object, so callers can concatenate unconditionally.
+ *
+ * @param {Record<string, unknown>} data
+ * @returns {string}
+ */
+const formatFrontmatter = (data) => {
+  const keys = Object.keys(data);
+  if (keys.length === 0) return "";
+  return `---\n${keys.map((k) => `${k}: ${formatScalar(data[k])}`).join("\n")}\n---\n`;
+};
+
+/**
+ * Narrow frontmatter to the keys one target understands, renaming where the
+ * dialects disagree. A `null` spec means pass everything through.
+ *
+ * @param {Record<string, unknown>} data
+ * @param {(string | [string, string])[] | null | undefined} spec
+ * @returns {Record<string, unknown>}
+ */
+const pick = (data, spec) => {
+  if (spec === null) return { ...data };
+  const out = {};
+  for (const entry of spec ?? []) {
+    const [from, to] = Array.isArray(entry) ? entry : [entry, entry];
+    if (data[from] !== undefined) out[to] = data[from];
+  }
+  return out;
+};
+
+// ---------------------------------------------------------------------------
+// Discovery
+// ---------------------------------------------------------------------------
+
+/**
+ * List a folder's entries, or nothing if it does not exist.
+ *
+ * Dotfiles are never assets. The empty source folders each carry a `.gitkeep` so the
+ * layout survives in git, and this keeps those — along with stray .DS_Store and the
+ * like — out of discovery explicitly rather than by accident of extension filtering.
+ *
+ * @param {string} dir
+ * @returns {string[]} Sorted, dotfiles removed.
+ */
+const listDir = (dir) =>
+  fs.existsSync(dir)
+    ? fs
+        .readdirSync(dir)
+        .filter((entry) => !entry.startsWith("."))
+        .sort()
+    : [];
+
+/**
+ * Read every source folder and return what is there. Missing folders are treated as
+ * empty, so the repo need not carry a folder it has no assets for.
+ *
+ * @param {string} sourceRoot
+ * @returns {Record<string, Asset[]>}
+ */
+const discover = (sourceRoot) => {
+  const assets = { skills: [], prompts: [], instructions: [], agents: [], hooks: [], mcp: [] };
+
+  for (const name of listDir(path.join(sourceRoot, "skills"))) {
+    const dir = path.join(sourceRoot, "skills", name);
+    const file = path.join(dir, "SKILL.md");
+    if (!fs.statSync(dir).isDirectory() || !fs.existsSync(file)) continue;
+    const { data, body } = parseFrontmatter(fs.readFileSync(file, "utf8"));
+    assets.skills.push({ kind: "skills", name, dir, file, data, body });
+  }
+
+  for (const kind of ["prompts", "instructions", "agents"]) {
+    for (const entry of listDir(path.join(sourceRoot, kind))) {
+      if (!entry.endsWith(".md")) continue;
+      const file = path.join(sourceRoot, kind, entry);
+      const { data, body } = parseFrontmatter(fs.readFileSync(file, "utf8"));
+      assets[kind].push({ kind, name: entry.replace(/\.md$/, ""), file, data, body });
+    }
+  }
+
+  for (const entry of listDir(path.join(sourceRoot, "hooks"))) {
+    if (!entry.endsWith(".json")) continue;
+    assets.hooks.push({
+      kind: "hooks",
+      name: entry.replace(/\.json$/, ""),
+      file: path.join(sourceRoot, "hooks", entry),
+      data: {},
+    });
+  }
+
+  for (const name of listDir(path.join(sourceRoot, "mcp"))) {
+    const dir = path.join(sourceRoot, "mcp", name);
+    if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) continue;
+    const override = path.join(dir, "register.json");
+    const entry = fs.existsSync(override)
+      ? JSON.parse(fs.readFileSync(override, "utf8"))
+      : { command: "node", args: [path.join(dir, "server.mjs")] };
+    if (!fs.existsSync(entry.args?.[0] ?? "")) continue;
+    assets.mcp.push({ kind: "mcp", name, dir, ...entry });
+  }
+
+  return assets;
+};
+
+// ---------------------------------------------------------------------------
+// Emission
+// ---------------------------------------------------------------------------
+
+/**
+ * Render one asset in one target's dialect: its filename, its content, and whether
+ * anything was actually rewritten.
+ *
+ * `verbatim` is the interesting part. It compares the emitted bytes against the
+ * source, and it is what decides whether a symlink would be honest: if a dialect
+ * needed different frontmatter then the file has to be real, because a link would
+ * claim the content is identical when it is not.
+ *
+ * @param {Asset} asset
+ * @param {Target} target
+ * @param {string} sourceRoot
+ * @returns {{ filename: string, content: string, verbatim: boolean } | null}
+ *   Null when this target has no convention for the asset's kind.
+ */
+const emit = (asset, target, sourceRoot) => {
+  const dest = DESTS[asset.kind];
+  if (!dest) return null;
+
+  const filename = (FILENAMES[asset.kind]?.[target] ?? ((n) => `${n}.md`))(asset.name);
+  if (asset.kind === "hooks") {
+    return {
+      filename: `${asset.name}.json`,
+      content: fs.readFileSync(asset.file, "utf8"),
+      verbatim: true,
+    };
+  }
+
+  const spec = FRONTMATTER[asset.kind]?.[target];
+  const front = formatFrontmatter(pick(asset.data, spec));
+  const from = path.relative(sourceRoot, asset.file);
+  const content = `${front}${front ? "\n" : ""}${marker(from)}\n\n${asset.body}`;
+  const verbatim = `${front}${asset.body}` === fs.readFileSync(asset.file, "utf8");
+  return { filename, content, verbatim };
+};
+
+// ---------------------------------------------------------------------------
+// Planning. Every command builds a list of ops and then either prints or runs
+// them, so --dry-run is exact rather than a separate code path that can drift.
+// ---------------------------------------------------------------------------
+
+/**
+ * Turn a routing-table entry into a real path. A leading `~/` is relative to the
+ * home directory, anything else to the project.
+ *
+ * @param {string} spec
+ * @param {string} home
+ * @param {string} projectRoot
+ * @returns {string}
+ */
+const resolveDest = (spec, home, projectRoot) => {
+  if (spec.startsWith("~/")) return path.join(home, spec.slice(2));
+  return path.join(projectRoot, spec);
+};
+
+/**
+ * Plan every placement for one scope. Does not touch the filesystem.
+ *
+ * @param {object} args
+ * @param {Record<string, Asset[]>} args.assets
+ * @param {Scope} args.scope
+ * @param {Target[]} args.targets
+ * @param {string} args.home
+ * @param {string} args.projectRoot
+ * @param {string[]} args.only        Asset names to limit to; empty means all.
+ * @param {string} args.sourceRoot
+ * @returns {{ ops: Op[], gaps: string[] }} `gaps` explains what was deliberately skipped.
+ */
+const planAssets = ({ assets, scope, targets, home, projectRoot, only, sourceRoot }) => {
+  const ops = [];
+  const gaps = new Set();
+
+  for (const kind of ["skills", "prompts", "instructions", "agents", "hooks"]) {
+    for (const asset of assets[kind]) {
+      if (only.length > 0 && !only.includes(asset.name)) continue;
+      // An instruction fragment with an applyTo is scoped, so it becomes a file.
+      // One without is always-on, and belongs in the composed instruction files
+      // instead — emitting both would deliver the same rule to Copilot twice.
+      if (kind === "instructions" && asset.data.applyTo === undefined) continue;
+
+      // Destination dir -> the target that claimed it first. Two targets can resolve
+      // to the same folder — `.claude/skills` serves Claude Code and Copilot both — and
+      // whoever gets there first decides the dialect, which is why `targets` order
+      // matters. Without this the same file would be written twice.
+      const seen = new Map();
+      for (const target of targets) {
+        const spec = DESTS[kind][scope][target];
+        if (!spec) {
+          const key = `${kind}/${scope}/${target}`;
+          if (GAPS[key]) gaps.add(`${key}: ${GAPS[key]}`);
+          continue;
+        }
+
+        const dir = resolveDest(spec, home, projectRoot);
+        if (seen.has(dir)) continue; // e.g. .claude/skills serves claude and copilot both
+        seen.set(dir, target);
+
+        const emitted = emit(asset, target, sourceRoot);
+        if (!emitted) continue;
+
+        if (kind === "skills") {
+          const destDir = path.join(dir, asset.name);
+          if (scope === "personal") ops.push({ action: "symlink", from: asset.dir, to: destDir });
+          else ops.push({ action: "copyDir", from: asset.dir, to: destDir, stamp: emitted });
+          continue;
+        }
+
+        const to = path.join(dir, emitted.filename);
+        if (scope === "personal" && emitted.verbatim)
+          ops.push({ action: "symlink", from: asset.file, to });
+        else ops.push({ action: "write", to, content: emitted.content, from: asset.file });
+      }
+    }
+  }
+
+  return { ops, gaps: [...gaps] };
+};
+
+/**
+ * Plan the composition of always-on fragments — those without an `applyTo` — into
+ * whichever file each tool reads for always-on rules.
+ *
+ * Only the managed block is touched, so anything written around it — a project's own
+ * policy, your own notes — is left exactly as it was. For a project this means
+ * `AGENTS.md` plus generated pointers at `CLAUDE.md` and
+ * `.github/copilot-instructions.md`; for you personally it means
+ * `~/.copilot/copilot-instructions.md` and `~/.claude/CLAUDE.md`.
+ *
+ * @param {object} args
+ * @param {Record<string, Asset[]>} args.assets
+ * @param {Scope} args.scope
+ * @param {Target[]} args.targets
+ * @param {string} args.home
+ * @param {string} args.projectRoot
+ * @param {string[]} args.only
+ * @param {string | null} [args.template] Seed file when the target has no AGENTS.md.
+ * @param {string} args.sourceRoot
+ * @returns {Op[]} Empty when there is nothing always-on to compose.
+ */
+const planCompose = ({ assets, scope, targets, home, projectRoot, only, template, sourceRoot }) => {
+  const fragments = assets.instructions.filter(
+    (asset) => (only.length === 0 || only.includes(asset.name)) && asset.data.applyTo === undefined,
+  );
+  if (fragments.length === 0) return [];
+
+  const body = fragments
+    .map((asset) => `<!-- from ${path.relative(sourceRoot, asset.file)} -->\n${asset.body.trim()}`)
+    .join("\n\n");
+  const block = `${BLOCK_BEGIN}\n\n${body}\n\n${BLOCK_END}`;
+  const ops = [];
+
+  if (scope === "personal") {
+    // ~/.copilot/copilot-instructions.md is the only home-level file Copilot reads
+    // — verified; AGENTS.md and CLAUDE.md there are ignored.
+    if (targets.includes("copilot")) {
+      ops.push({ action: "block", to: path.join(home, ".copilot/copilot-instructions.md"), block });
+    }
+    if (targets.includes("claude")) {
+      ops.push({ action: "block", to: path.join(home, ".claude/CLAUDE.md"), block });
+    }
+    return ops;
+  }
+
+  const agentsPath = path.join(projectRoot, "AGENTS.md");
+  ops.push({ action: "block", to: agentsPath, block, template });
+
+  // Claude Code reads only CLAUDE.md, and supports @-imports — so a one-line
+  // pointer keeps a single source of truth instead of a duplicate that drifts.
+  if (targets.includes("claude")) {
+    ops.push({
+      action: "write",
+      to: path.join(projectRoot, "CLAUDE.md"),
+      content: `${marker("AGENTS.md")}\n\n@AGENTS.md\n`,
+      from: agentsPath,
+    });
+  }
+
+  // Copilot CLI reads AGENTS.md natively, but .github/copilot-instructions.md is
+  // the file every Copilot surface is documented to pick up. It has no import
+  // syntax, so the pointer has to be prose — and it repeats the one rule most
+  // worth surviving a skipped file.
+  if (targets.includes("copilot") || targets.includes("vscode")) {
+    ops.push({
+      action: "write",
+      to: path.join(projectRoot, ".github/copilot-instructions.md"),
+      content: `${marker("AGENTS.md")}\n\n# Copilot instructions\n\nRead \`AGENTS.md\` in the repository root before you start. It is the single\nsource of truth for how to work in this repo, and it applies to you — this file\nonly points at it so that every Copilot surface picks it up.\n`,
+      from: agentsPath,
+    });
+  }
+  return ops;
+};
+
+/**
+ * Plan the registration of each MCP server. The absolute path is derived from where
+ * this repo actually sits, so nothing is hardcoded to one machine.
+ *
+ * @param {object} args
+ * @param {Record<string, Asset[]>} args.assets
+ * @param {string} args.home
+ * @param {string[]} args.only
+ * @returns {Op[]}
+ */
+const planMcp = ({ assets, home, only }) => {
+  return assets.mcp
+    .filter((server) => only.length === 0 || only.includes(server.name))
+    .map((server) => ({
+      action: "exec",
+      command: "copilot",
+      args: ["mcp", "add", server.name, "--", server.command, ...server.args],
+      env: { COPILOT_HOME: path.join(home, ".copilot") },
+    }));
+};
+
+// ---------------------------------------------------------------------------
+// Application
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether a file carries our provenance tag, and is therefore ours to overwrite.
+ *
+ * @param {string} file
+ * @returns {boolean}
+ */
+const isGenerated = (file) => {
+  try {
+    return fs.readFileSync(file, "utf8").includes(TAG);
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Whether the destination already holds exactly what we were going to write. This
+ * is what keeps formats that cannot carry a comment — the hooks JSON — idempotent.
+ *
+ * @param {string} to
+ * @param {string} [content]
+ * @returns {boolean}
+ */
+const unchanged = (to, content) => {
+  try {
+    return content !== undefined && fs.readFileSync(to, "utf8") === content;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Decide whether writing to `to` would destroy someone's work.
+ *
+ * Three things make a write safe. It carries our tag, so it is ours to replace. Or
+ * its content already matches what we were about to write — which is what keeps
+ * formats that cannot hold a comment, like the hooks JSON, idempotent. Or `--force`
+ * was passed. Failing all three, the file is treated as hand-written.
+ *
+ * @param {string} to
+ * @param {boolean} force
+ * @param {string} [content] Intended content, for the already-matching case.
+ * @returns {string | null} A message explaining the refusal, or null to proceed.
+ */
+const guard = (to, force, content) => {
+  if (!fs.existsSync(to) || force || isGenerated(to) || unchanged(to, content)) return null;
+  if (fs.lstatSync(to).isSymbolicLink()) return null;
+  return `refusing to overwrite hand-written ${to} (pass --force to override)`;
+};
+
+/**
+ * Copy a skill folder. Only its SKILL.md is stamped with the provenance marker;
+ * bundled references and scripts are copied byte for byte, since rewriting someone
+ * else`s payload is not our business.
+ *
+ * @param {string} from
+ * @param {string} to
+ * @param {{ content: string } | null} stamp  Emitted SKILL.md, or null for subfolders.
+ * @param {boolean} force
+ * @param {Results} results
+ * @returns {void}
+ */
+const copyDir = (from, to, stamp, force, results) => {
+  fs.mkdirSync(to, { recursive: true });
+  for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
+    const src = path.join(from, entry.name);
+    const dst = path.join(to, entry.name);
+    if (entry.isDirectory()) {
+      copyDir(src, dst, null, force, results);
+      continue;
+    }
+    // The skill's own SKILL.md gets the generated marker; bundled references and
+    // scripts are copied byte for byte, since we have no business rewriting them.
+    if (entry.name === "SKILL.md" && stamp) {
+      const problem = guard(dst, force, stamp.content);
+      if (problem) {
+        results.skipped.push(problem);
+        continue;
+      }
+      if (unchanged(dst, stamp.content)) {
+        results.unchanged.push(dst);
+        continue;
+      }
+      fs.writeFileSync(dst, stamp.content);
+    } else {
+      const content = fs.readFileSync(src, "utf8");
+      if (unchanged(dst, content)) {
+        results.unchanged.push(dst);
+        continue;
+      }
+      fs.copyFileSync(src, dst);
+    }
+    results.wrote.push(dst);
+  }
+};
+
+/**
+ * Replace only the managed block inside a file, creating it from the template when
+ * the file does not exist yet and appending when it exists without a block. Whatever
+ * surrounds the block is never touched, which is how a project keeps its own policy.
+ *
+ * @param {Op} op
+ * @param {Results} results
+ * @returns {void}
+ */
+const applyBlock = (op, results) => {
+  let text = "";
+  if (fs.existsSync(op.to)) {
+    text = fs.readFileSync(op.to, "utf8");
+  } else if (op.template && fs.existsSync(op.template)) {
+    text = fs.readFileSync(op.template, "utf8");
+  }
+
+  if (text.includes(BLOCK_BEGIN) && text.includes(BLOCK_END)) {
+    const before = text.slice(0, text.indexOf(BLOCK_BEGIN));
+    const after = text.slice(text.indexOf(BLOCK_END) + BLOCK_END.length);
+    text = `${before}${op.block}${after}`;
+  } else {
+    text = `${text.trimEnd()}${text.trim() ? "\n\n" : ""}${op.block}\n`;
+  }
+
+  if (unchanged(op.to, text)) {
+    results.unchanged.push(op.to);
+    return;
+  }
+  fs.mkdirSync(path.dirname(op.to), { recursive: true });
+  fs.writeFileSync(op.to, text);
+  results.wrote.push(op.to);
+};
+
+/**
+ * Perform a plan, or under `dryRun` describe it. The dry run evaluates the same
+ * clobber guard as a real pass, so it predicts refusals instead of promising writes
+ * that would not happen.
+ *
+ * @param {Op[]} ops
+ * @param {{ dryRun?: boolean, force?: boolean }} options
+ * @returns {Results}
+ */
+const apply = (ops, { dryRun, force }) => {
+  const results = { wrote: [], linked: [], ran: [], unchanged: [], skipped: [] };
+
+  for (const op of ops) {
+    if (dryRun) {
+      if (op.action === "exec") {
+        results.wrote.push(`(dry run) ${op.command} ${op.args.join(" ")}`);
+        continue;
+      }
+      // Run the same guard a real pass would, so a dry run predicts refusals
+      // instead of promising writes that would not happen.
+      const target = op.action === "copyDir" ? path.join(op.to, "SKILL.md") : op.to;
+      const content = op.action === "copyDir" ? op.stamp?.content : op.content;
+      const problem = op.action === "block" ? null : guard(target, force, content);
+      if (problem) results.skipped.push(`(dry run) ${problem}`);
+      else results.wrote.push(`(dry run) ${op.action} ${op.to}${op.from ? ` <- ${op.from}` : ""}`);
+      continue;
+    }
+
+    if (op.action === "symlink") {
+      fs.mkdirSync(path.dirname(op.to), { recursive: true });
+      // A stale link or a previous copy is ours to replace; a real hand-written
+      // file at the same path is not.
+      if (fs.existsSync(op.to) || fs.lstatSync(op.to, { throwIfNoEntry: false })) {
+        const problem = guard(op.to, force);
+        if (problem) {
+          results.skipped.push(problem);
+          continue;
+        }
+        fs.rmSync(op.to, { recursive: true, force: true });
+      }
+      fs.symlinkSync(op.from, op.to);
+      results.linked.push(op.to);
+      continue;
+    }
+
+    if (op.action === "write") {
+      const problem = guard(op.to, force, op.content);
+      if (problem) {
+        results.skipped.push(problem);
+        continue;
+      }
+      if (unchanged(op.to, op.content)) {
+        results.unchanged.push(op.to);
+        continue;
+      }
+      fs.mkdirSync(path.dirname(op.to), { recursive: true });
+      fs.writeFileSync(op.to, op.content);
+      results.wrote.push(op.to);
+      continue;
+    }
+
+    if (op.action === "copyDir") {
+      copyDir(op.from, op.to, op.stamp, force, results);
+      continue;
+    }
+
+    if (op.action === "block") {
+      applyBlock(op, results);
+      continue;
+    }
+
+    if (op.action === "exec") {
+      const run = spawnSync(op.command, op.args, {
+        encoding: "utf8",
+        env: { ...process.env, ...op.env },
+      });
+      if (run.error?.code === "ENOENT") {
+        // Easy to hit: the Copilot desktop app bundles its CLI rather than putting one
+        // on your PATH, so `copilot` can be absent on a machine that clearly has it.
+        results.skipped.push(
+          `\`${op.command}\` is not on your PATH, so nothing was registered.\n` +
+            `          The Copilot desktop app bundles a CLI at\n` +
+            `          ~/Library/Caches/github-copilot-sdk/cli/<version>/copilot — put that on\n` +
+            `          your PATH, or register by hand as mcp/<name>/README.md describes.`,
+        );
+      } else if (run.error || run.status !== 0) {
+        results.skipped.push(
+          `${op.command} ${op.args.join(" ")} failed: ${run.error?.message ?? run.stderr?.trim() ?? `exit ${run.status}`}`,
+        );
+      } else {
+        results.ran.push(`${op.command} ${op.args.join(" ")}`);
+      }
+    }
+  }
+
+  return results;
+};
+
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
+
+const USAGE = `Usage: bin/install <command> [options]
+
+Commands:
+  personal              Symlink personal assets into your user profile
+  project <dir>         Copy assets into a target repo, for committing
+  mcp                   Register this repo's MCP servers at user level
+  list                  Show discovered assets and where they would go
+
+Options:
+  --targets <list>      Comma-separated: claude, copilot, vscode (default: all)
+  --only <list>         Comma-separated asset names (default: all)
+  --template <file>     Starter AGENTS.md for a project that has none
+  --source <dir>        Read assets from here instead of the repo root
+  --home <dir>          Treat this as the home directory (for testing)
+  --dry-run             Print what would happen, change nothing
+  --force               Overwrite files that are not marked as generated
+`;
+
+/**
+ * Parse argv. Throws on an unknown option or target rather than ignoring it, since
+ * a silently dropped `--targets` would install more than asked.
+ *
+ * @param {string[]} argv
+ * @returns {object}
+ */
+const parseArgs = (argv) => {
+  const opts = {
+    command: argv[0],
+    positional: [],
+    targets: ["claude", "copilot", "vscode"],
+    only: [],
+    template: null,
+    sourceRoot: REPO,
+    home: os.homedir(),
+    dryRun: false,
+    force: false,
+  };
+
+  for (let i = 1; i < argv.length; i++) {
+    const arg = argv[i];
+    const next = () => argv[++i];
+    if (arg === "--targets")
+      opts.targets = next()
+        .split(",")
+        .map((t) => t.trim());
+    else if (arg === "--only")
+      opts.only = next()
+        .split(",")
+        .map((t) => t.trim());
+    else if (arg === "--template") opts.template = path.resolve(next());
+    else if (arg === "--source") opts.sourceRoot = path.resolve(next());
+    else if (arg === "--home") opts.home = path.resolve(next());
+    else if (arg === "--dry-run") opts.dryRun = true;
+    else if (arg === "--force") opts.force = true;
+    else if (arg.startsWith("-")) throw new Error(`Unknown option: ${arg}`);
+    else opts.positional.push(arg);
+  }
+
+  const unknown = opts.targets.filter((t) => !["claude", "copilot", "vscode"].includes(t));
+  if (unknown.length > 0) throw new Error(`Unknown target(s): ${unknown.join(", ")}`);
+  return opts;
+};
+
+/**
+ * Print what happened and return the process exit code.
+ *
+ * @param {Results} results
+ * @param {string[]} [gaps]
+ * @returns {number} 0 when nothing was skipped, 1 otherwise.
+ */
+const report = (results, gaps) => {
+  for (const line of results.linked) console.log(`  linked  ${line}`);
+  for (const line of results.wrote) console.log(`  wrote   ${line}`);
+  for (const line of results.ran) console.log(`  ran     ${line}`);
+  for (const line of results.skipped) console.log(`  skipped ${line}`);
+  if (gaps?.length) {
+    console.log("\nNot installed, by design:");
+    for (const gap of gaps.sort()) console.log(`  - ${gap}`);
+  }
+  const total = results.linked.length + results.wrote.length + results.ran.length;
+  const same = results.unchanged.length ? `, ${results.unchanged.length} already current` : "";
+  console.log(`\n${total} change(s)${same}, ${results.skipped.length} skipped.`);
+  return results.skipped.length === 0 ? 0 : 1;
+};
+
+/**
+ * Dispatch one command.
+ *
+ * @param {string[]} argv
+ * @returns {number} Process exit code.
+ */
+const main = (argv) => {
+  const opts = parseArgs(argv);
+  const assets = discover(opts.sourceRoot);
+
+  if (!opts.command || opts.command === "help" || opts.command === "--help") {
+    console.log(USAGE);
+    return 0;
+  }
+
+  if (opts.command === "list") {
+    for (const [kind, items] of Object.entries(assets)) {
+      if (items.length === 0) continue;
+      console.log(`${kind}:`);
+      for (const item of items) {
+        let where;
+        if (kind === "mcp") {
+          where = `${item.command} ${item.args.join(" ")}`;
+        } else if (kind === "instructions" && item.data.applyTo === undefined) {
+          // Always-on, so it is composed rather than placed. Say so, or the listing
+          // would name destinations this fragment never reaches.
+          where =
+            "composed into project:AGENTS.md, personal:~/.copilot/copilot-instructions.md + ~/.claude/CLAUDE.md";
+        } else {
+          where = Object.entries(DESTS[kind] ?? {})
+            .flatMap(([scope, byTarget]) =>
+              [...new Set(Object.values(byTarget).filter(Boolean))].map((d) => `${scope}:${d}`),
+            )
+            .join(", ");
+        }
+        console.log(`  ${item.name}\n      ${where}`);
+      }
+    }
+    return 0;
+  }
+
+  if (opts.command === "personal") {
+    const shared = {
+      assets,
+      scope: "personal",
+      targets: opts.targets,
+      home: opts.home,
+      projectRoot: opts.home,
+      only: opts.only,
+      sourceRoot: opts.sourceRoot,
+    };
+    const { ops, gaps } = planAssets(shared);
+    ops.push(...planCompose(shared));
+    return report(apply(ops, opts), gaps);
+  }
+
+  if (opts.command === "project") {
+    const projectRoot = opts.positional[0] && path.resolve(opts.positional[0]);
+    if (!projectRoot) throw new Error("project requires a target directory");
+    if (!fs.existsSync(projectRoot)) throw new Error(`No such directory: ${projectRoot}`);
+
+    const shared = {
+      assets,
+      scope: "project",
+      targets: opts.targets,
+      home: opts.home,
+      projectRoot,
+      only: opts.only,
+      template: opts.template,
+      sourceRoot: opts.sourceRoot,
+    };
+    const { ops, gaps } = planAssets(shared);
+    ops.push(...planCompose(shared));
+    return report(apply(ops, opts), gaps);
+  }
+
+  if (opts.command === "mcp") {
+    const ops = planMcp({ assets, home: opts.home, only: opts.only });
+    if (ops.length === 0) {
+      console.log("No MCP servers found.");
+      return 0;
+    }
+    return report(apply(ops, opts), []);
+  }
+
+  throw new Error(`Unknown command: ${opts.command}`);
+};
+
+try {
+  process.exit(main(process.argv.slice(2)));
+} catch (error) {
+  console.error(`Error: ${error.message}`);
+  process.exit(1);
+}

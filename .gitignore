@@ -1,0 +1,13 @@
+# Working notes that reference private projects. Never published.
+LOCAL-NOTES.md
+
+.DS_Store
+node_modules/
+
+# JetBrains keeps machine-specific state in here, so it stays out. If you ever want
+# Prettier-on-save enforced for everyone rather than set up per machine, un-ignore
+# .idea/prettier.xml on its own — the rest of .idea/ is churn.
+.idea/
+
+# Note .vscode/ is deliberately NOT ignored: settings.json and extensions.json there
+# are shared project configuration, not personal state.

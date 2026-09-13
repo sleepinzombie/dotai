@@ -1,0 +1,26 @@
+# YAML rather than JSON so the two non-obvious choices can carry their reasons.
+#
+# The `.yaml` suffix is load-bearing: Prettier reads YAML from a bare `.prettierrc`
+# quite happily, but editors map that filename to JSON and then flag every comment
+# here as a syntax error. Naming the format explicitly keeps the comments and keeps
+# every editor quiet.
+
+# The existing code already matches Prettier's defaults — double quotes, semicolons,
+# two-space indent, trailing commas — so width is the only thing worth setting. 100
+# keeps all but a handful of long string literals intact.
+printWidth: 100
+
+# Markdown prose here is hand-wrapped, which keeps diffs to the line that changed
+# rather than to a whole reflowed paragraph. "preserve" is Prettier's default; it is
+# stated explicitly because switching it would rewrite every paragraph in the repo.
+proseWrap: preserve
+
+overrides:
+  # bin/install is deliberately extensionless so it reads as a command rather than a
+  # script, which means Prettier cannot infer a parser from the filename. This tells
+  # it which one to use. The npm scripts also pass `bin/install` as an explicit
+  # argument, because expanding a directory only collects filenames Prettier already
+  # recognises — an override alone does not guarantee the file is picked up.
+  - files: bin/install
+    options:
+      parser: babel

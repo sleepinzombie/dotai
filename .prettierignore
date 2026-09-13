@@ -1,0 +1,21 @@
+node_modules/
+
+# Assets are model-facing content, and their exact bytes are the deliverable rather
+# than a style choice. The pr skill's output contract depends on precise fence widths
+# and indentation, and reflowing an instruction fragment changes what a model reads,
+# which is a behaviour change wearing a formatting change's clothes.
+#
+# Also practical: the installer symlinks a personal asset only when the emitted file
+# is byte-identical to its source, so a formatter reaching in here can quietly turn
+# links into copies.
+#
+# Format these by hand. If you do want Prettier on them, run `prettier --check` on
+# one first and read the diff before committing to it.
+skills/
+instructions/
+prompts/
+agents/
+templates/
+
+# Working notes; gitignored anyway.
+LOCAL-NOTES.md

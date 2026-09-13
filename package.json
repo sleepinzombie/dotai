@@ -1,0 +1,19 @@
+{
+  "name": "dotai",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Neutral-form AI tooling assets, plus an installer that emits the dialect each tool reads",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node bin/install-test.mjs && node mcp/ask-user/smoke-test.mjs",
+    "format": "prettier --write . bin/install",
+    "format:check": "prettier --check . bin/install"
+  },
+  "devDependencies": {
+    "prettier": "3.9.6"
+  }
+}
